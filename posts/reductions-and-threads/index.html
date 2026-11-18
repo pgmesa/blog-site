@@ -1,0 +1,718 @@
+<!DOCTYPE html><html lang="en" data-astro-cid-z4jru4n3><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>How PyTorch sums a tensor, and splits the work between threads | pgmesa&#39;s blog</title><meta name="description" content="A reduction as a TensorIterator whose output does not move, why the obvious sum loop is slow and wrong, the cascade sum, how parallel_for splits a range, and why sum() can change with the number of threads while sum(dim) cannot."><meta name="author" content="Pablo García Mesa"><link rel="canonical" href="https://blog.pgmesa.com/posts/reductions-and-threads/"><link rel="icon" type="image/svg+xml" href="/favicon.svg"><link rel="alternate" type="application/rss+xml" title="pgmesa's blog" href="/rss.xml"><link rel="sitemap" href="/sitemap-index.xml"><meta property="og:type" content="article"><meta property="og:title" content="How PyTorch sums a tensor, and splits the work between threads"><meta property="og:description" content="A reduction as a TensorIterator whose output does not move, why the obvious sum loop is slow and wrong, the cascade sum, how parallel_for splits a range, and why sum() can change with the number of threads while sum(dim) cannot."><meta property="og:url" content="https://blog.pgmesa.com/posts/reductions-and-threads/"><meta property="og:site_name" content="pgmesa's blog"><meta property="article:published_time" content="2026-11-18T00:00:00.000Z"><meta property="article:modified_time" content="2026-11-18T00:00:00.000Z"><meta property="article:tag" content="pytorch"><meta property="article:tag" content="threading"><meta property="article:tag" content="performance"><meta property="og:image" content="https://blog.pgmesa.com/og/posts/reductions-and-threads.png"><meta property="og:image:type" content="image/png"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="How PyTorch sums a tensor, and splits the work between threads"><meta name="twitter:card" content="summary_large_image"><script type="application/ld+json">{"@context":"https://schema.org","@type":"BlogPosting","headline":"How PyTorch sums a tensor, and splits the work between threads","description":"A reduction as a TensorIterator whose output does not move, why the obvious sum loop is slow and wrong, the cascade sum, how parallel_for splits a range, and why sum() can change with the number of threads while sum(dim) cannot.","url":"https://blog.pgmesa.com/posts/reductions-and-threads/","mainEntityOfPage":"https://blog.pgmesa.com/posts/reductions-and-threads/","author":{"@type":"Person","name":"Pablo García Mesa","url":"https://github.com/pgmesa"},"datePublished":"2026-11-18T00:00:00.000Z","dateModified":"2026-11-18T00:00:00.000Z","keywords":"pytorch, threading, performance"}</script><script type="module" src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon="{&quot;token&quot;:&quot;956bb0ad972944c48d0de3df881b57fa&quot;}"></script><link rel="stylesheet" href="/_astro/_..CkAVCZT_.css"><link rel="stylesheet" href="/_astro/BaseLayout.BDGeZDxW.css"><style>.src[data-astro-cid-3c55tpoi]{white-space:nowrap}.src[data-astro-cid-3c55tpoi] code[data-astro-cid-3c55tpoi]{white-space:normal}.src-repo[data-astro-cid-3c55tpoi]{text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-right:.3em;font-size:.75em}
+</style><style>.cascade-sum[data-astro-cid-kpxkszln]{margin:2rem 0}svg[data-astro-cid-kpxkszln]{width:100%;max-width:680px;height:auto;display:block}text[data-astro-cid-kpxkszln]{fill:var(--fg);font-family:var(--font-ui);font-size:13px}.label[data-astro-cid-kpxkszln]{font-weight:700}.note[data-astro-cid-kpxkszln]{fill:var(--muted)}.warm[data-astro-cid-kpxkszln]{fill:var(--warm);font-size:12px}.small[data-astro-cid-kpxkszln]{font-family:var(--font-mono);font-size:11px}.tiny[data-astro-cid-kpxkszln]{font-family:var(--font-mono);fill:var(--muted);font-size:10px}.box[data-astro-cid-kpxkszln]{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1px}.slot[data-astro-cid-kpxkszln]{fill:var(--bg);stroke:var(--accent);stroke-width:1px}.arrow[data-astro-cid-kpxkszln]{stroke:var(--muted);stroke-width:1.2px}.head[data-astro-cid-kpxkszln]{fill:var(--muted)}figcaption[data-astro-cid-kpxkszln]{color:var(--muted);margin-top:.5rem;font-size:.875rem}.reduction-split[data-astro-cid-m2lz3izq]{margin:2rem 0}svg[data-astro-cid-m2lz3izq]{width:100%;max-width:680px;height:auto;display:block}text[data-astro-cid-m2lz3izq]{fill:var(--fg);font-family:var(--font-ui);font-size:13px}.label[data-astro-cid-m2lz3izq]{font-weight:700}.note[data-astro-cid-m2lz3izq]{fill:var(--muted)}.warm[data-astro-cid-m2lz3izq]{fill:var(--warm);font-size:12px}.small[data-astro-cid-m2lz3izq]{font-family:var(--font-mono);font-size:11px}.tiny[data-astro-cid-m2lz3izq]{font-family:var(--font-mono);fill:var(--muted);font-size:10px}.tiny-fg[data-astro-cid-m2lz3izq]{font-family:var(--font-mono);font-size:10px}.band-a[data-astro-cid-m2lz3izq]{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1px}.band-b[data-astro-cid-m2lz3izq]{fill:color-mix(in srgb, var(--warm) 18%, var(--bg));stroke:var(--warm);stroke-width:1px}.out[data-astro-cid-m2lz3izq]{fill:var(--bg);stroke:var(--accent);stroke-width:1px}.arrow[data-astro-cid-m2lz3izq]{stroke:var(--muted);stroke-width:1px}.head[data-astro-cid-m2lz3izq]{fill:var(--muted)}figcaption[data-astro-cid-m2lz3izq]{color:var(--muted);margin-top:.5rem;font-size:.875rem}
+</style></head><body data-astro-cid-z4jru4n3><header class="container site-header" data-astro-cid-z4jru4n3><a class="site-title" href="/" data-astro-cid-z4jru4n3><svg class="logo" viewBox="0 0 32 32" aria-hidden="true" data-astro-cid-f7espo7c><clipPath id="logo-lens" data-astro-cid-f7espo7c><circle cx="19" cy="19" r="7" data-astro-cid-f7espo7c></circle></clipPath><rect x="9" y="3" width="14" height="14" rx="2" class="layer back" data-astro-cid-f7espo7c></rect><rect x="6" y="6" width="14" height="14" rx="2" class="layer middle" data-astro-cid-f7espo7c></rect><rect x="3" y="9" width="14" height="14" rx="2" class="layer front" data-astro-cid-f7espo7c></rect><circle cx="19" cy="19" r="7" class="lens-bg" data-astro-cid-f7espo7c></circle><g clip-path="url(#logo-lens)" data-astro-cid-f7espo7c><rect x="11.8" y="11.8" width="2.1" height="2.1" rx="0.4" class="front" data-astro-cid-f7espo7c></rect><rect x="14.5" y="11.8" width="2.1" height="2.1" rx="0.4" class="front" data-astro-cid-f7espo7c></rect><rect x="17.2" y="11.8" width="2.1" height="2.1" rx="0.4" class="middle" data-astro-cid-f7espo7c></rect><rect x="19.9" y="11.8" width="2.1" height="2.1" rx="0.4" class="back" data-astro-cid-f7espo7c></rect><rect x="11.8" y="14.5" width="2.1" height="2.1" rx="0.4" class="front" data-astro-cid-f7espo7c></rect><rect x="14.5" y="14.5" width="2.1" height="2.1" rx="0.4" class="front" data-astro-cid-f7espo7c></rect><rect x="17.2" y="14.5" width="2.1" height="2.1" rx="0.4" class="middle" data-astro-cid-f7espo7c></rect><rect x="19.9" y="14.5" width="2.1" height="2.1" rx="0.4" class="back" data-astro-cid-f7espo7c></rect><rect x="11.8" y="17.2" width="2.1" height="2.1" rx="0.4" class="front" data-astro-cid-f7espo7c></rect><rect x="14.5" y="17.2" width="2.1" height="2.1" rx="0.4" class="front" data-astro-cid-f7espo7c></rect><rect x="17.2" y="17.2" width="2.1" height="2.1" rx="0.4" class="middle" data-astro-cid-f7espo7c></rect><rect x="11.8" y="19.9" width="2.1" height="2.1" rx="0.4" class="front" data-astro-cid-f7espo7c></rect><rect x="14.5" y="19.9" width="2.1" height="2.1" rx="0.4" class="front" data-astro-cid-f7espo7c></rect></g><circle cx="19" cy="19" r="7" class="glass" data-astro-cid-f7espo7c></circle><line x1="24" y1="24" x2="30" y2="30" class="handle" data-astro-cid-f7espo7c></line></svg>pgmesa&#39;s blog</a><nav data-astro-cid-z4jru4n3><a href="/rss.xml" data-astro-cid-z4jru4n3>RSS</a><a href="https://github.com/pgmesa" data-astro-cid-z4jru4n3>GitHub</a><a href="https://www.linkedin.com/in/pgmesa/" data-astro-cid-z4jru4n3>LinkedIn</a></nav></header><main class="container" data-astro-cid-z4jru4n3><article data-astro-cid-ssdmjifj><header data-astro-cid-ssdmjifj><h1 data-astro-cid-ssdmjifj>How PyTorch sums a tensor, and splits the work between threads</h1><p class="muted" data-astro-cid-ssdmjifj>pgmesa &middot; <time datetime="2026-11-18T00:00:00.000Z" data-astro-cid-ssdmjifj>18 November 2026</time> &middot; 30 min read</p></header><div class="page-toc" data-astro-cid-lifsiwye><aside class="toc-side" aria-label="On this page" data-astro-cid-lifsiwye><nav data-astro-cid-lifsiwye><a class="toc-series" href="/series/rebuilding-pytorch/" data-astro-cid-lifsiwye>Rebuilding PyTorch · 6 of 8</a><div class="toc-head" data-astro-cid-lifsiwye><p class="toc-title" data-astro-cid-lifsiwye>On this page</p><button type="button" class="toc-hide" aria-expanded="true" data-astro-cid-lifsiwye>Hide</button></div><ol class="toc-list" data-astro-cid-lifsiwye><li data-astro-cid-lifsiwye><a href="#1-what-a-reduction-is" data-astro-cid-lifsiwye>1. What a reduction is</a></li><li data-astro-cid-lifsiwye><a href="#2-a-tensoriterator-whose-output-does-not-move" data-astro-cid-lifsiwye>2. A TensorIterator whose output does not move</a></li><li data-astro-cid-lifsiwye><a href="#3-the-obvious-loop-and-why-it-is-slow" data-astro-cid-lifsiwye>3. The obvious loop, and why it is slow</a></li><li data-astro-cid-lifsiwye><a href="#4-why-it-is-also-wrong" data-astro-cid-lifsiwye>4. Why it is also wrong</a></li><li data-astro-cid-lifsiwye><a href="#5-the-cascade-sum" data-astro-cid-lifsiwye>5. The cascade sum</a></li><li data-astro-cid-lifsiwye><a href="#6-rows-and-columns" data-astro-cid-lifsiwye>6. Rows and columns</a></li><li data-astro-cid-lifsiwye><a href="#7-not-only-sums" data-astro-cid-lifsiwye>7. Not only sums</a></li><li data-astro-cid-lifsiwye><a href="#8-parallel_for-splitting-a-range-between-threads" data-astro-cid-lifsiwye>8. parallel_for: splitting a range between threads</a></li><li data-astro-cid-lifsiwye><a href="#9-splitting-a-reduction" data-astro-cid-lifsiwye>9. Splitting a reduction</a></li><li data-astro-cid-lifsiwye><a href="#10-does-the-result-depend-on-the-number-of-threads" data-astro-cid-lifsiwye>10. Does the result depend on the number of threads?</a></li><li data-astro-cid-lifsiwye><a href="#key-takeaways" data-astro-cid-lifsiwye>Key takeaways</a></li><li data-astro-cid-lifsiwye><a href="#further-reading" data-astro-cid-lifsiwye>Further reading</a></li></ol></nav></aside><script>
+        try {
+          if (localStorage.getItem('toc-hidden') === '1') {
+            const side = document.currentScript.previousElementSibling;
+            side.classList.add('collapsed');
+            const hide = side.querySelector('.toc-hide');
+            hide.textContent = 'Show';
+            hide.setAttribute('aria-expanded', 'false');
+          }
+        } catch {}
+      </script><button type="button" class="toc-fab" aria-label="Sections of this page" data-astro-cid-lifsiwye><svg viewBox="0 0 24 24" aria-hidden="true" data-astro-cid-lifsiwye><path d="M4 6h16M4 12h16M4 18h10" data-astro-cid-lifsiwye></path></svg></button><dialog class="toc-sheet" aria-label="On this page" data-astro-cid-lifsiwye><div class="toc-head" data-astro-cid-lifsiwye><p class="toc-title" data-astro-cid-lifsiwye>On this page</p><button type="button" class="toc-close" data-astro-cid-lifsiwye>Close</button></div><ol class="toc-list" data-astro-cid-lifsiwye><li data-astro-cid-lifsiwye><a href="#1-what-a-reduction-is" data-astro-cid-lifsiwye>1. What a reduction is</a></li><li data-astro-cid-lifsiwye><a href="#2-a-tensoriterator-whose-output-does-not-move" data-astro-cid-lifsiwye>2. A TensorIterator whose output does not move</a></li><li data-astro-cid-lifsiwye><a href="#3-the-obvious-loop-and-why-it-is-slow" data-astro-cid-lifsiwye>3. The obvious loop, and why it is slow</a></li><li data-astro-cid-lifsiwye><a href="#4-why-it-is-also-wrong" data-astro-cid-lifsiwye>4. Why it is also wrong</a></li><li data-astro-cid-lifsiwye><a href="#5-the-cascade-sum" data-astro-cid-lifsiwye>5. The cascade sum</a></li><li data-astro-cid-lifsiwye><a href="#6-rows-and-columns" data-astro-cid-lifsiwye>6. Rows and columns</a></li><li data-astro-cid-lifsiwye><a href="#7-not-only-sums" data-astro-cid-lifsiwye>7. Not only sums</a></li><li data-astro-cid-lifsiwye><a href="#8-parallel_for-splitting-a-range-between-threads" data-astro-cid-lifsiwye>8. parallel_for: splitting a range between threads</a></li><li data-astro-cid-lifsiwye><a href="#9-splitting-a-reduction" data-astro-cid-lifsiwye>9. Splitting a reduction</a></li><li data-astro-cid-lifsiwye><a href="#10-does-the-result-depend-on-the-number-of-threads" data-astro-cid-lifsiwye>10. Does the result depend on the number of threads?</a></li><li data-astro-cid-lifsiwye><a href="#key-takeaways" data-astro-cid-lifsiwye>Key takeaways</a></li><li data-astro-cid-lifsiwye><a href="#further-reading" data-astro-cid-lifsiwye>Further reading</a></li></ol><a class="toc-series" href="/series/rebuilding-pytorch/" data-astro-cid-lifsiwye>Rebuilding PyTorch · 6 of 8</a></dialog></div><script type="module">var e=document.querySelector(`.page-toc`);if(e){let t=[...e.querySelectorAll(`.toc-list`)],n=[...t[0].querySelectorAll(`a`)].map(e=>document.getElementById(decodeURIComponent(e.hash.slice(1)))),r=e.querySelector(`.toc-fab`),i=!1,a=()=>{i=!1;let e=-1;for(let[t,r]of n.entries())r&&r.getBoundingClientRect().top<120&&(e=t);for(let n of t){let t=[...n.querySelectorAll(`a`)];for(let[n,r]of t.entries())r.classList.toggle(`active`,n===e);for(let r of n.querySelectorAll(`:scope > li`))r.classList.toggle(`current`,e>=0&&r.contains(t[e]))}r?.classList.toggle(`shown`,scrollY>200)};addEventListener(`scroll`,()=>{i||(i=!0,requestAnimationFrame(a))},{passive:!0}),a();let o=e.querySelector(`.toc-side`),s=e.querySelector(`.toc-hide`),c=e=>{o?.classList.toggle(`collapsed`,e),s&&(s.textContent=e?`Show`:`Hide`,s.setAttribute(`aria-expanded`,String(!e)))};try{c(localStorage.getItem(`toc-hidden`)===`1`)}catch{}s?.addEventListener(`click`,()=>{let e=!o?.classList.contains(`collapsed`);c(e);try{localStorage.setItem(`toc-hidden`,e?`1`:`0`)}catch{}});let l=e.querySelector(`.toc-sheet`);l&&r&&(r.addEventListener(`click`,()=>l.showModal()),e.querySelector(`.toc-close`)?.addEventListener(`click`,()=>l.close()),l.addEventListener(`click`,e=>{(e.target===l||e.target.closest(`a`))&&l.close()}))}</script><details class="series-toc" data-astro-cid-x3pxgsip><summary data-astro-cid-x3pxgsip>Part of <a href="/series/rebuilding-pytorch/" data-astro-cid-x3pxgsip><strong data-astro-cid-x3pxgsip>Rebuilding PyTorch</strong></a> (6 of 8)</summary><ol data-astro-cid-x3pxgsip><li value="1" data-astro-cid-x3pxgsip><a href="/posts/why-rebuild-pytorch/" data-astro-cid-x3pxgsip>Why I rebuilt PyTorch&#39;s core from scratch</a></li><li value="2" data-astro-cid-x3pxgsip><a href="/posts/what-a-tensor-is/" data-astro-cid-x3pxgsip>What a PyTorch tensor really is</a></li><li class="interlude" data-astro-cid-x3pxgsip><span class="interlude-label" data-astro-cid-x3pxgsip>Interlude: </span><a href="/posts/memory-and-the-cpu/" data-astro-cid-x3pxgsip>What the CPU does when your code reads memory</a></li><li value="3" data-astro-cid-x3pxgsip><a href="/posts/n-dimensional-loops/" data-astro-cid-x3pxgsip>How PyTorch walks a tensor of any shape</a></li><li value="4" data-astro-cid-x3pxgsip><a href="/posts/tensoriterator/" data-astro-cid-x3pxgsip>How PyTorch prepares the loop of every operation</a></li><li value="5" data-astro-cid-x3pxgsip><a href="/posts/cpu-kernels/" data-astro-cid-x3pxgsip>How a PyTorch kernel uses the vector registers of every CPU</a></li><li value="6" data-astro-cid-x3pxgsip><strong data-astro-cid-x3pxgsip>How PyTorch sums a tensor, and splits the work between threads</strong></li><li value="7" data-astro-cid-x3pxgsip><a href="/posts/autograd/" data-astro-cid-x3pxgsip>How PyTorch computes gradients</a></li><li value="8" data-astro-cid-x3pxgsip><a href="/posts/cuda/" data-astro-cid-x3pxgsip>How PyTorch runs the same operations on a GPU</a></li></ol></details><p>Every operation so far wrote one output element for every input element: <code>a + b</code> reads one number of <code>a</code> and one of <code>b</code>, and writes one number. A reduction is the other kind: <code>x.sum()</code>, <code>x.mean(1)</code> or <code>x.max(0)</code> read many numbers and write one per group. It runs on the same machinery, the same iterator, the same 2-D loop and the same vector registers, but it brings two new problems. The additions depend on each other, so the simplest loop leaves most of the core idle. And every addition rounds, so the order in which the numbers are added changes the result. Once there are threads, that order depends on how the work is split, which leads to a question I did not expect when I started: does <code>x.sum()</code> give the same number with one thread and with eight?</p>
+<blockquote>
+<p><strong>Before you start.</strong> This article builds on the three before it: <a href="/posts/n-dimensional-loops/">How PyTorch walks a tensor of any shape</a> (the 2-D loop, and how the work is split between threads in its section 9), <a href="/posts/tensoriterator/">How PyTorch prepares the loop of every operation</a> (strides of 0, the order of the dimensions and how they are merged) and <a href="/posts/cpu-kernels/">How a PyTorch kernel uses the vector registers of every CPU</a> (<code>Vectorized&lt;T&gt;</code> and the two lambdas of a kernel). The hardware it relies on, latency, cache lines and cores, is in <a href="/posts/memory-and-the-cpu/">the interlude</a>.</p>
+</blockquote>
+<p>This is the path the article follows:</p>
+<div class="article-map"><ol>
+<li><a href="#1-what-a-reduction-is">What a reduction is</a>.</li>
+<li><a href="#2-a-tensoriterator-whose-output-does-not-move">A TensorIterator whose output does not move</a>.</li>
+<li><a href="#3-the-obvious-loop-and-why-it-is-slow">The obvious loop, and why it is slow</a>.</li>
+<li><a href="#4-why-it-is-also-wrong">Why it is also wrong</a>.</li>
+<li><a href="#5-the-cascade-sum">The cascade sum</a>.</li>
+<li><a href="#6-rows-and-columns">Rows and columns</a>.</li>
+<li><a href="#7-not-only-sums">Not only sums</a>.</li>
+<li><a href="#8-parallel_for-splitting-a-range-between-threads"><code>parallel_for</code>: splitting a range between threads</a>.</li>
+<li><a href="#9-splitting-a-reduction">Splitting a reduction</a>.</li>
+<li><a href="#10-does-the-result-depend-on-the-number-of-threads">Does the result depend on the number of threads?</a>.</li>
+</ol></div>
+<p>And at the end, the <a href="#key-takeaways">key takeaways</a>.</p>
+<p>All the timings are from a Ryzen 7 9700X, a Zen 5 with 8 cores, on one thread unless a table says otherwise. They come from <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/scripts/articles/reductions.py" title="raxis: scripts/articles/reductions.py" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>reductions.py</code></a>, which also builds and runs a small C++ program for section 3. I ran it in November 2026, with NumPy 2.5.4, PyTorch 2.14.1 and Raxis 0.5.0, on Windows 11 25H2 (MSVC 19.44) and Ubuntu 24.04 under WSL2 (GCC 13.3), on the same machine. The tables are from Windows, and the text says where Linux differs.</p>
+<h2 id="1-what-a-reduction-is">1. What a reduction is</h2>
+<p>A reduction combines many numbers into one: a sum, a mean, a maximum, the position of the maximum. On a tensor it can combine all of its elements, or only those along some dimensions. Take a small one:</p>
+<span class="katex-display"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>x</mi><mo>=</mo><mrow><mo fence="true">(</mo><mtable rowspacing="0.16em" columnalign="center center center" columnspacing="1em"><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>1</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>2</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>3</mn></mstyle></mtd></mtr><mtr><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>4</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>5</mn></mstyle></mtd><mtd><mstyle scriptlevel="0" displaystyle="false"><mn>6</mn></mstyle></mtd></mtr></mtable><mo fence="true">)</mo></mrow></mrow><annotation encoding="application/x-tex">x = \begin{pmatrix} 1 &amp; 2 &amp; 3 \\ 4 &amp; 5 &amp; 6 \end{pmatrix}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em"></span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2778em"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em"></span><span class="minner"><span class="mopen delimcenter" style="top:0em"><span class="delimsizing size3">(</span></span><span class="mord"><span class="mtable"><span class="col-align-c"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.45em"><span style="top:-3.61em"><span class="pstrut" style="height:3em"></span><span class="mord"><span class="mord">1</span></span></span><span style="top:-2.41em"><span class="pstrut" style="height:3em"></span><span class="mord"><span class="mord">4</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.95em"><span></span></span></span></span></span><span class="arraycolsep" style="width:0.5em"></span><span class="arraycolsep" style="width:0.5em"></span><span class="col-align-c"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.45em"><span style="top:-3.61em"><span class="pstrut" style="height:3em"></span><span class="mord"><span class="mord">2</span></span></span><span style="top:-2.41em"><span class="pstrut" style="height:3em"></span><span class="mord"><span class="mord">5</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.95em"><span></span></span></span></span></span><span class="arraycolsep" style="width:0.5em"></span><span class="arraycolsep" style="width:0.5em"></span><span class="col-align-c"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.45em"><span style="top:-3.61em"><span class="pstrut" style="height:3em"></span><span class="mord"><span class="mord">3</span></span></span><span style="top:-2.41em"><span class="pstrut" style="height:3em"></span><span class="mord"><span class="mord">6</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.95em"><span></span></span></span></span></span></span></span><span class="mclose delimcenter" style="top:0em"><span class="delimsizing size3">)</span></span></span></span></span></span></span>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Call</th><th>Adds together</th><th>Result</th><th>Shape</th></tr></thead><tbody><tr><td><code>x.sum()</code></td><td>all six</td><td><code>21</code></td><td><code>[]</code></td></tr><tr><td><code>x.sum(0)</code></td><td>each column: 1 + 4, 2 + 5, 3 + 6</td><td><code>[5, 7, 9]</code></td><td><code>[3]</code></td></tr><tr><td><code>x.sum(1)</code></td><td>each row: 1 + 2 + 3, 4 + 5 + 6</td><td><code>[6, 15]</code></td><td><code>[2]</code></td></tr><tr><td><code>x.sum(1, keepdim=True)</code></td><td>the same</td><td><code>[[6], [15]]</code></td><td><code>[2, 1]</code></td></tr></tbody></table>
+<p>The dimension passed to <code>sum</code> is the one that disappears: <code>sum(0)</code> reduces dimension 0, the rows, and leaves one number per column. With <code>keepdim=True</code> the reduced dimension stays, with size 1, which is useful when the result has to broadcast against <code>x</code> again, as in <code>x - x.mean(1, keepdim=True)</code>.</p>
+<p>So a reduction has an output with fewer elements than its input, and every output element is the result of many input elements. That is the only thing that changes with respect to <code>a + b</code>, and the next section shows how PyTorch turns it into something its iterator already knows.</p>
+<h2 id="2-a-tensoriterator-whose-output-does-not-move">2. A TensorIterator whose output does not move</h2>
+<p>The trick is a stride of 0, the same one that <a href="/posts/tensoriterator/#4-the-strides-a-broadcast-dimension-is-a-stride-of-0">broadcasting</a> uses for inputs, now on the output. <code>sum</code> first allocates its result with the reduced shape. Then it views that result with the input’s number of dimensions, where every reduced dimension comes back with size 1 and stride 0 (<a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/native/ReduceOpsUtils.h#L170-L183" title="pytorch: aten/src/ATen/native/ReduceOpsUtils.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>ReduceOpsUtils.h</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/ops/reduce_ops_utils.h#L82-L117" title="raxis: libraxis/raxis/ops/reduce_ops_utils.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>reduce_ops_utils.h</code></a>):</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto" tabindex="0" data-language="cpp"><code><span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D">// From review_reduce_result: put the reduced dims back, with stride 0</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">for</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (</span><span style="color:#D73A49;--shiki-dark:#F97583">int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> dim </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">; dim </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> ndim; </span><span style="color:#D73A49;--shiki-dark:#F97583">++</span><span style="color:#24292E;--shiki-dark:#E1E4E8">dim) {</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    if</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (mask.</span><span style="color:#6F42C1;--shiki-dark:#B392F0">test</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(dim)) {</span><span style="color:#6A737D;--shiki-dark:#6A737D">            // a reduced dimension</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        shape.</span><span style="color:#6F42C1;--shiki-dark:#B392F0">push_back</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(</span><span style="color:#005CC5;--shiki-dark:#79B8FF">1</span><span style="color:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        strides.</span><span style="color:#6F42C1;--shiki-dark:#B392F0">push_back</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(</span><span style="color:#005CC5;--shiki-dark:#79B8FF">0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">);</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    } </span><span style="color:#D73A49;--shiki-dark:#F97583">else</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        shape.</span><span style="color:#6F42C1;--shiki-dark:#B392F0">push_back</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(result_shape[result_idx]);</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        strides.</span><span style="color:#6F42C1;--shiki-dark:#B392F0">push_back</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(result_strides[result_idx]);</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        result_idx</span><span style="color:#D73A49;--shiki-dark:#F97583">++</span><span style="color:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p>For <code>x.sum(0)</code> on our 2 x 3 tensor, the result <code>[5, 7, 9]</code> is viewed as a 1 x 3 tensor with strides <code>[0, 1]</code>, which the iterator broadcasts against the 2 x 3 input: moving down a row does not move in the output, so the two rows of a column land on the same output element. The iterator is built as for any other operation, with this view as its output and <code>x</code> as its input (<code>TensorIterator::reduce_op</code>, marked as a reduction). When the loop runs, each step does <code>out += x[i]</code> at an output position that stays still along the reduced dimension. The output is filled with 0 first, the identity of the sum, so that the first addition has something to add to.</p>
+<p>There is one change in how the iterator orders the dimensions. In <a href="/posts/tensoriterator/#7-the-order-which-dimension-goes-inside">the article on TensorIterator</a> the dimension with the smallest strides went inside, so that the inner loop reads memory in order. For a reduction, the reduced dimensions go inside first, whatever their strides (<a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/TensorIterator.cpp#L262-L268" title="pytorch: aten/src/ATen/TensorIterator.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>TensorIterator.cpp</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/tensor/tensor_iterator.cpp#L598-L604" title="raxis: libraxis/raxis/tensor/tensor_iterator.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>tensor_iterator.cpp</code></a>):</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto" tabindex="0" data-language="cpp"><code><span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">if</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (is_reduction_ </span><span style="color:#D73A49;--shiki-dark:#F97583">&amp;&amp;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> operands_[idx].is_output) {</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D">    // move reduced dimensions to the front</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    if</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> ((stride0 </span><span style="color:#D73A49;--shiki-dark:#F97583">==</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">) </span><span style="color:#D73A49;--shiki-dark:#F97583">!=</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (stride1 </span><span style="color:#D73A49;--shiki-dark:#F97583">==</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">)) {</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">        return</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> stride1 </span><span style="color:#D73A49;--shiki-dark:#F97583">==</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#D73A49;--shiki-dark:#F97583"> ?</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 1</span><span style="color:#D73A49;--shiki-dark:#F97583"> :</span><span style="color:#D73A49;--shiki-dark:#F97583"> -</span><span style="color:#005CC5;--shiki-dark:#79B8FF">1</span><span style="color:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p>So the inner loop, dimension 0, always runs along a reduced dimension, and the kernel can tell from one number that it is looking at a reduction: the output stride of dimension 0 is 0. These are the strides, in bytes, that the loop receives for a 1000 x 1000 float32 tensor, after the reordering and the merging of dimensions (dimension 0 first, as the iterator stores them):</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Call</th><th>Shape</th><th>Input strides</th><th>Output strides</th><th>Inner loop</th></tr></thead><tbody><tr><td><code>x.sum(1)</code></td><td>[1000, 1000]</td><td>[4, 4000]</td><td>[0, 4]</td><td>along a row, in order</td></tr><tr><td><code>x.sum(0)</code></td><td>[1000, 1000]</td><td>[4000, 4]</td><td>[0, 4]</td><td>down a column,<br/>4000 bytes per step</td></tr><tr><td><code>x.sum()</code></td><td>[1000000]</td><td>[4]</td><td>[0]</td><td>all of <code>x</code>, in order</td></tr></tbody></table>
+<p><code>x.sum()</code> merges into one dimension, as <code>a + b</code> did, because both dimensions are reduced and the input is contiguous. <code>x.sum(0)</code> is the interesting one: its inner loop goes down a column, with a stride of 4000 bytes, which is exactly what the iterator avoids for elementwise operations. Section 6 shows how the kernel turns this around. First, the loop itself.</p>
+<h2 id="3-the-obvious-loop-and-why-it-is-slow">3. The obvious loop, and why it is slow</h2>
+<p>For <code>x.sum()</code> the loop is one line, the one anyone would write first:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto" tabindex="0" data-language="cpp"><code><span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">float</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> acc </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0.0</span><span style="color:#D73A49;--shiki-dark:#F97583">f</span><span style="color:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">for</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (</span><span style="color:#D73A49;--shiki-dark:#F97583">int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> i </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">; i </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> n; i</span><span style="color:#D73A49;--shiki-dark:#F97583">++</span><span style="color:#24292E;--shiki-dark:#E1E4E8">) {</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    acc </span><span style="color:#D73A49;--shiki-dark:#F97583">+=</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> x[i];</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p>Each addition needs the result of the one before it. This is the chain of <a href="/posts/memory-and-the-cpu/#2-the-cache-levels">the interlude</a> again, now made of additions instead of loads: the core cannot start addition <code>i + 1</code> until addition <code>i</code> has finished. So the loop runs at the latency of one addition, not at the rate at which the core can start them.</p>
+<p>The experiment (<a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/scripts/articles/reductions/sum_loops.cpp" title="raxis: scripts/articles/reductions/sum_loops.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>sum_loops.cpp</code></a>) writes the loop in five ways and times them on 64Ki floats, 256 KiB. After the first run they sit in the L2, so the memory is not the limit. Each loop runs 2000 times in a row, and the table keeps the fastest of 5 such runs. The program is built with AVX2, and with the compiler told to add exactly in the order written (<code>/fp:precise</code> on MSVC, <code>-ffp-contract=off</code> on GCC):</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Sum of 64Ki float32 from the L2</th><th style="text-align:right">ns per element</th><th style="text-align:right">Independent chains</th></tr></thead><tbody><tr><td>one <code>float</code> accumulator</td><td style="text-align:right">0.361</td><td style="text-align:right">1</td></tr><tr><td>four <code>float</code> accumulators</td><td style="text-align:right">0.090</td><td style="text-align:right">4</td></tr><tr><td>one AVX2 vector of 8 accumulators</td><td style="text-align:right">0.045</td><td style="text-align:right">8</td></tr><tr><td>four AVX2 vectors, 32 accumulators</td><td style="text-align:right">0.016</td><td style="text-align:right">32</td></tr><tr><td>one <code>double</code> accumulator</td><td style="text-align:right">0.401</td><td style="text-align:right">1</td></tr></tbody></table>
+<p>The first row is about two cycles per element at this CPU’s clock, which is the latency of a floating-point addition on Zen 5. With four accumulators, <code>acc[i % 4] += x[i]</code>, there are four chains that do not depend on each other, and the <a href="/posts/memory-and-the-cpu/#10-inside-a-core-running-ahead-and-guessing-branches">out-of-order core</a> runs them side by side: four times faster. A vector register of eight floats is eight accumulators in one instruction, and four vectors are 32: 22 times faster than the first loop. At that point the additions are no longer the limit; how fast the L2 delivers the bytes is. With GCC on Linux the numbers are within a few percent of these.</p>
+<p>You might wonder why the compiler does not do this by itself, since it vectorizes <code>a + b</code> without help. Because it would change the result. With four accumulators the numbers are added in another order, and for floats the order matters, as the next section shows. A C/C++ compiler may not reorder floating-point additions unless it is told that it may, with <code>-ffast-math</code> on GCC and Clang, or <code>/fp:fast</code> on MSVC. For integers the order does not change the result, and compilers do vectorize integer sums on their own.</p>
+<p>So the kernel has to write the accumulators itself. PyTorch’s does: it keeps four vectors of accumulators, 32 for float32 with AVX2, the fourth row of the table. The last row, a <code>double</code> accumulator, is as slow as the first, and the next section explains why someone might still want it.</p>
+<h2 id="4-why-it-is-also-wrong">4. Why it is also wrong</h2>
+<p>A float32 has 24 bits for the digits of the number (the significand), so it can hold every integer up to <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>24</mn></msup><mo>=</mo><mn>16,777,216</mn></mrow><annotation encoding="application/x-tex">2^{24} = 16{,}777{,}216</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em"><span style="top:-3.063em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">24</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em"></span><span class="mord">16</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">777</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">216</span></span></span></span>, and from there only every second one. Now sum <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>25</mn></msup></mrow><annotation encoding="application/x-tex">2^{25}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em"><span style="top:-3.063em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">25</span></span></span></span></span></span></span></span></span></span></span></span> ones, about 33 million, with the first loop. When the accumulator reaches 16,777,216, adding 1 gives 16,777,217, which a float32 cannot hold, and the addition rounds back to 16,777,216. Each of the remaining 16 million additions does the same, and the loop returns 16,777,216, half of the right answer:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Sum of <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>25</mn></msup></mrow><annotation encoding="application/x-tex">2^{25}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em"><span style="top:-3.063em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">25</span></span></span></span></span></span></span></span></span></span></span></span> ones</th><th style="text-align:right">Result</th></tr></thead><tbody><tr><td>one <code>float</code> accumulator</td><td style="text-align:right">16,777,216</td></tr><tr><td>four <code>float</code> accumulators</td><td style="text-align:right">33,554,432</td></tr><tr><td>one vector, four vectors, one <code>double</code></td><td style="text-align:right">33,554,432</td></tr></tbody></table>
+<p>With four accumulators each one only reaches about 8 million, so every addition is exact. That is the first lesson: more accumulators are not only faster, they also keep each partial sum smaller.</p>
+<p>Ones are the extreme case, but every addition rounds. When the accumulator is large and the number added is small, the low bits of the small number fall off the end of the significand. With random numbers from [0, 1), the error grows with the number of elements, because the accumulator keeps growing and the numbers added do not. This is the relative error of each loop against the exact sum:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Floats from [0, 1), relative error</th><th style="text-align:right">1M numbers</th><th style="text-align:right">16M numbers</th></tr></thead><tbody><tr><td>one <code>float</code> accumulator</td><td style="text-align:right">1.5e-05</td><td style="text-align:right">9.9e-05</td></tr><tr><td>four <code>float</code> accumulators</td><td style="text-align:right">3.8e-07</td><td style="text-align:right">1.2e-05</td></tr><tr><td>one vector of 8</td><td style="text-align:right">3.8e-07</td><td style="text-align:right">4.4e-06</td></tr><tr><td>four vectors, 32</td><td style="text-align:right">7.3e-07</td><td style="text-align:right">9.5e-07</td></tr><tr><td>one <code>double</code> accumulator</td><td style="text-align:right">1.9e-08</td><td style="text-align:right">6.5e-09</td></tr></tbody></table>
+<p>An error of 1e-4 means the fourth significant digit is wrong, in a type that holds about seven. More accumulators help again, because each one stays smaller, but the error still grows with the size: at 1M the order of the middle rows is partly luck, at 16M the pattern is clear. A <code>double</code> accumulator has 53 bits and its error is tiny, but it is a single chain, and a vector register holds half as many doubles as floats. That is the trade-off a sum has to solve: accumulators that stay small, without losing the speed of 32 of them.</p>
+<h2 id="5-the-cascade-sum">5. The cascade sum</h2>
+<p>The classical answer is pairwise summation: add the numbers in pairs, then add the sums of the pairs in pairs, and so on, like the rounds of a tournament. Every addition then combines two numbers of similar size, so few bits fall off, and the error grows with the logarithm of the number of elements instead of with the number itself. NumPy uses it. Done literally it needs a recursion, or a stack of partial sums, which does not fit well in a vector loop.</p>
+<p>PyTorch uses a version of it that runs in one pass with a fixed amount of memory, the cascade sum (<code>multi_row_sum</code>, <a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/native/cpu/SumKernel.cpp#L345-L411" title="pytorch: aten/src/ATen/native/cpu/SumKernel.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>SumKernel.cpp</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/ops/cpu/sum_kernel.cpp#L186-L258" title="raxis: libraxis/raxis/ops/cpu/sum_kernel.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>sum_kernel.cpp</code></a>). It keeps four levels of accumulators. Level 0 adds a fixed number of elements, <code>level_step</code>; then it is added into level 1 and set back to zero. Once level 1 has received <code>level_step</code> such sums, it is added into level 2, and so on, the way a carry moves between the digits of a number:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto" tabindex="0" data-language="cpp"><code><span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">const</span><span style="color:#D73A49;--shiki-dark:#F97583"> int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> level_power </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> std</span><span style="color:#24292E;--shiki-dark:#E1E4E8">::</span><span style="color:#6F42C1;--shiki-dark:#B392F0">max</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(</span><span style="color:#D73A49;--shiki-dark:#F97583">int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(</span><span style="color:#005CC5;--shiki-dark:#79B8FF">4</span><span style="color:#24292E;--shiki-dark:#E1E4E8">), </span><span style="color:#6F42C1;--shiki-dark:#B392F0">ceil_log2</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(size) </span><span style="color:#D73A49;--shiki-dark:#F97583">/</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> num_levels);</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">const</span><span style="color:#D73A49;--shiki-dark:#F97583"> int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> level_step </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#D73A49;--shiki-dark:#F97583"> int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(</span><span style="color:#005CC5;--shiki-dark:#79B8FF">1</span><span style="color:#24292E;--shiki-dark:#E1E4E8">) </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;&lt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> level_power;</span><span style="color:#6A737D;--shiki-dark:#6A737D">   // 16 or more</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">const</span><span style="color:#D73A49;--shiki-dark:#F97583"> int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> level_mask </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> level_step </span><span style="color:#D73A49;--shiki-dark:#F97583">-</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 1</span><span style="color:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">for</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (; i </span><span style="color:#D73A49;--shiki-dark:#F97583">+</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> level_step </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;=</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> size;) {</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    for</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (</span><span style="color:#D73A49;--shiki-dark:#F97583">int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> j </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">; j </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> level_step; </span><span style="color:#D73A49;--shiki-dark:#F97583">++</span><span style="color:#24292E;--shiki-dark:#E1E4E8">j, </span><span style="color:#D73A49;--shiki-dark:#F97583">++</span><span style="color:#24292E;--shiki-dark:#E1E4E8">i) {</span><span style="color:#6A737D;--shiki-dark:#6A737D">     // level 0: level_step elements</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">        for</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (</span><span style="color:#D73A49;--shiki-dark:#F97583">int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> k </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">; k </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> nrows; </span><span style="color:#D73A49;--shiki-dark:#F97583">++</span><span style="color:#24292E;--shiki-dark:#E1E4E8">k) {</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">            acc[</span><span style="color:#005CC5;--shiki-dark:#79B8FF">0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">][k] </span><span style="color:#D73A49;--shiki-dark:#F97583">+=</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> load</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(in_data </span><span style="color:#D73A49;--shiki-dark:#F97583">+</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> i </span><span style="color:#D73A49;--shiki-dark:#F97583">*</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> row_stride, col_stride, k);</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    }</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    for</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (</span><span style="color:#D73A49;--shiki-dark:#F97583">int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> lev </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 1</span><span style="color:#24292E;--shiki-dark:#E1E4E8">; lev </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> num_levels; </span><span style="color:#D73A49;--shiki-dark:#F97583">++</span><span style="color:#24292E;--shiki-dark:#E1E4E8">lev) {</span><span style="color:#6A737D;--shiki-dark:#6A737D">    // the carry</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">        for</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (</span><span style="color:#D73A49;--shiki-dark:#F97583">int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> k </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">; k </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> nrows; </span><span style="color:#D73A49;--shiki-dark:#F97583">++</span><span style="color:#24292E;--shiki-dark:#E1E4E8">k) {</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">            acc[lev][k] </span><span style="color:#D73A49;--shiki-dark:#F97583">+=</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> acc[lev </span><span style="color:#D73A49;--shiki-dark:#F97583">-</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 1</span><span style="color:#24292E;--shiki-dark:#E1E4E8">][k];</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">            acc[lev </span><span style="color:#D73A49;--shiki-dark:#F97583">-</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 1</span><span style="color:#24292E;--shiki-dark:#E1E4E8">][k] </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        }</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">        if</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> ((i </span><span style="color:#D73A49;--shiki-dark:#F97583">&amp;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (level_mask </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;&lt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (lev </span><span style="color:#D73A49;--shiki-dark:#F97583">*</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> level_power))) </span><span style="color:#D73A49;--shiki-dark:#F97583">!=</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">) {</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">            break</span><span style="color:#24292E;--shiki-dark:#E1E4E8">;</span><span style="color:#6A737D;--shiki-dark:#6A737D">                                      // this level is not full yet</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p>The <code>nrows</code> accumulators of each level are independent sums, which gives the parallel chains of section 3. For a contiguous row, the kernel calls this function with <code>nrows = 4</code> and with <code>Vectorized&lt;float&gt;</code> as the type of each accumulator: 4 vectors of 8, the 32 chains of the fastest loop, with a cascade in each one.</p>
+<p>Follow <code>x.sum()</code> of a million floats. Each step of the loop reads 32 floats, one per chain, so there are 31,250 steps, and each chain adds 31,250 numbers. <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">⌈</mo><msub><mrow><mi>log</mi><mo>⁡</mo></mrow><mn>2</mn></msub><mn>31250</mn><mo stretchy="false">⌉</mo><mo>=</mo><mn>15</mn></mrow><annotation encoding="application/x-tex">\lceil \log_2 31250 \rceil = 15</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em"></span><span class="mopen">⌈</span><span class="mop"><span class="mop">lo<span style="margin-right:0.0139em">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em"><span style="top:-2.4559em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em"></span><span class="mord">31250</span><span class="mclose">⌉</span><span class="mspace" style="margin-right:0.2778em"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em"></span></span><span class="base"><span class="strut" style="height:0.6444em"></span><span class="mord">15</span></span></span></span>, and <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>15</mn><mi mathvariant="normal">/</mi><mn>4</mn></mrow><annotation encoding="application/x-tex">15 / 4</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em"></span><span class="mord">15/4</span></span></span></span> rounds down to 3, below the minimum of 4, so <code>level_power</code> is 4 and <code>level_step</code> is 16. In each of the 32 chains:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Level</th><th>Receives</th><th style="text-align:right">Adds before passing on</th><th style="text-align:right">Holds, for numbers from [0, 1)</th></tr></thead><tbody><tr><td>0</td><td>the elements</td><td style="text-align:right">16</td><td style="text-align:right">about 8</td></tr><tr><td>1</td><td>sums of 16 elements</td><td style="text-align:right">16</td><td style="text-align:right">about 128</td></tr><tr><td>2</td><td>sums of 256 elements</td><td style="text-align:right">16</td><td style="text-align:right">about 2,048</td></tr><tr><td>3</td><td>sums of 4,096 elements</td><td style="text-align:right">all the rest</td><td style="text-align:right">about 15,600 at the end</td></tr></tbody></table>
+<figure class="cascade-sum" data-astro-cid-kpxkszln><svg viewBox="0 0 680 420" role="img" aria-labelledby="cs-title cs-desc" data-astro-cid-kpxkszln><title id="cs-title">The four levels of one chain of the cascade sum</title><desc id="cs-desc" data-astro-cid-kpxkszln>One of the 32 chains that sum a million floats. Level 0 adds the elements one by one and, every 16 elements, adds its total into level 1 and starts again from zero; it never holds much more than 8. Level 1 adds 16 such sums, about 128, before passing its total to level 2. Level 2 adds 16 sums of 256 elements, about 2,048, before passing its total to level 3, which keeps everything until the end, about 15,600. Every addition combines numbers of similar size. A single accumulator would instead add every element to a total that grows to half a million.</desc><defs data-astro-cid-kpxkszln><marker id="cs-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse" data-astro-cid-kpxkszln><path d="M 0 0 L 10 5 L 0 10 z" class="head" data-astro-cid-kpxkszln></path></marker></defs><text x="40" y="30" class="label" data-astro-cid-kpxkszln>One chain of 32, summing 31,250 of a million floats</text><text x="40" y="48" class="note" data-astro-cid-kpxkszln>level_step = 16: each level adds 16 numbers, then passes their sum on</text><g data-astro-cid-kpxkszln><rect x="40" y="70" width="330" height="50" rx="4" class="box" data-astro-cid-kpxkszln></rect><text x="50" y="90" class="label" data-astro-cid-kpxkszln>Level 0</text><text x="120" y="90" class="small" data-astro-cid-kpxkszln>adds the elements, one by one</text><text x="50" y="109" class="note" data-astro-cid-kpxkszln>passes its sum on every 16 elements</text><rect x="400" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="411" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="422" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="433" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="444" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="455" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="466" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="477" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="488" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="499" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="510" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="521" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="532" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="543" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="554" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="565" y="86" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><text x="584" y="100" class="warm" data-astro-cid-kpxkszln>about 8</text><line x1="100" y1="122" x2="100" y2="144" class="arrow" marker-end="url(#cs-arrow)" data-astro-cid-kpxkszln></line><text x="110" y="137" class="tiny" data-astro-cid-kpxkszln>its sum, then back to 0</text></g><g data-astro-cid-kpxkszln><rect x="40" y="146" width="330" height="50" rx="4" class="box" data-astro-cid-kpxkszln></rect><text x="50" y="166" class="label" data-astro-cid-kpxkszln>Level 1</text><text x="120" y="166" class="small" data-astro-cid-kpxkszln>adds sums of 16 elements</text><text x="50" y="185" class="note" data-astro-cid-kpxkszln>passes its sum on every 256 elements</text><rect x="400" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="411" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="422" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="433" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="444" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="455" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="466" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="477" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="488" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="499" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="510" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="521" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="532" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="543" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="554" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="565" y="162" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><text x="584" y="176" class="warm" data-astro-cid-kpxkszln>about 128</text><line x1="100" y1="198" x2="100" y2="220" class="arrow" marker-end="url(#cs-arrow)" data-astro-cid-kpxkszln></line><text x="110" y="213" class="tiny" data-astro-cid-kpxkszln>its sum, then back to 0</text></g><g data-astro-cid-kpxkszln><rect x="40" y="222" width="330" height="50" rx="4" class="box" data-astro-cid-kpxkszln></rect><text x="50" y="242" class="label" data-astro-cid-kpxkszln>Level 2</text><text x="120" y="242" class="small" data-astro-cid-kpxkszln>adds sums of 256 elements</text><text x="50" y="261" class="note" data-astro-cid-kpxkszln>passes its sum on every 4,096 elements</text><rect x="400" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="411" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="422" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="433" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="444" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="455" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="466" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="477" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="488" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="499" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="510" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="521" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="532" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="543" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="554" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><rect x="565" y="238" width="8" height="18" rx="2" class="slot" data-astro-cid-kpxkszln></rect><text x="584" y="252" class="warm" data-astro-cid-kpxkszln>about 2,048</text><line x1="100" y1="274" x2="100" y2="296" class="arrow" marker-end="url(#cs-arrow)" data-astro-cid-kpxkszln></line><text x="110" y="289" class="tiny" data-astro-cid-kpxkszln>its sum, then back to 0</text></g><g data-astro-cid-kpxkszln><rect x="40" y="298" width="330" height="50" rx="4" class="box" data-astro-cid-kpxkszln></rect><text x="50" y="318" class="label" data-astro-cid-kpxkszln>Level 3</text><text x="120" y="318" class="small" data-astro-cid-kpxkszln>adds sums of 4,096 elements</text><text x="50" y="337" class="note" data-astro-cid-kpxkszln>keeps everything until the end</text><text x="400" y="328" class="warm" data-astro-cid-kpxkszln>the rest, about 15,600 at the end</text></g><text x="40" y="392" class="note" data-astro-cid-kpxkszln>At the end: the four levels, then the four vectors, then the eight lanes are added together.</text><text x="40" y="410" class="note" data-astro-cid-kpxkszln>One accumulator would add every element to a total that grows to 500,000.</text></svg><figcaption data-astro-cid-kpxkszln>The numbers on the right are what each level holds before it passes its sum on, for numbers from [0, 1). Every addition combines numbers of similar size, so few bits are lost.</figcaption></figure>
+<p>Every addition at levels 0 to 2 adds numbers of similar size. At the end the four levels of each chain are added together, then the four vectors, then the eight lanes of the last vector, and that is the sum. The carry runs once every 16 elements, so it costs almost nothing: <code>x.sum()</code> of a million floats takes 0.027 ms in Raxis, 0.027 ns per element, close to the four-vector loop of section 3 even though the data now comes from the L3.</p>
+<p>And the error, now with the libraries, for 16M floats from [0, 1) in a row, and down the columns of the same numbers seen as a 2M x 8 matrix:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Relative error</th><th style="text-align:right">NumPy</th><th style="text-align:right">PyTorch</th><th style="text-align:right">Raxis</th></tr></thead><tbody><tr><td><code>sum()</code> of 16M in a row</td><td style="text-align:right">7.1e-09</td><td style="text-align:right">7.1e-09</td><td style="text-align:right">7.1e-09</td></tr><tr><td><code>sum(0)</code> of 2M x 8, worst column</td><td style="text-align:right">5.1e-05</td><td style="text-align:right">1.2e-07</td><td style="text-align:right">1.2e-07</td></tr><tr><td><code>sum()</code> of <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>25</mn></msup></mrow><annotation encoding="application/x-tex">2^{25}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em"><span style="top:-3.063em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">25</span></span></span></span></span></span></span></span></span></span></span></span> ones</td><td style="text-align:right">exact</td><td style="text-align:right">exact</td><td style="text-align:right">exact</td></tr></tbody></table>
+<p>In a row, the three are as good as a <code>double</code> accumulator. Down the columns, NumPy is as bad as the single <code>float</code> accumulator, and this is documented: NumPy’s pairwise summation is “only used when summing along the fast axis in memory”, as <a href="https://numpy.org/doc/stable/reference/generated/numpy.sum.html" target="_blank" rel="noopener">its documentation of <code>sum</code></a> says. For <code>sum(0)</code> of a C-contiguous array, NumPy adds the rows one after another into the output, <code>out[j] += x[i, j]</code>, so every column is a single chain of 2 million additions. PyTorch’s kernel runs a cascade per column, as the next section shows, and that is the factor of 400 in the second row. The three give the same numbers on Linux.</p>
+<h2 id="6-rows-and-columns">6. Rows and columns</h2>
+<p>The kernel receives the 2-D blocks of section 2, with the strides of the input and of the output, and picks one of its paths from them (<a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/native/cpu/SumKernel.cpp#L537-L612" title="pytorch: aten/src/ATen/native/cpu/SumKernel.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>SumKernel.cpp</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/ops/cpu/sum_kernel.cpp#L461-L503" title="raxis: libraxis/raxis/ops/cpu/sum_kernel.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>sum_kernel.cpp</code></a>):</p>
+<ul>
+<li><strong>Contiguous inner reduction.</strong> The input stride of the reduced dimension is 4 bytes: <code>sum()</code> and <code>sum(1)</code>. Each row is summed with the four vectors and their cascade, as in the last section (<code>vectorized_inner_sum</code>), and the eight lanes are added together at the end of each row.</li>
+<li><strong>Contiguous outer reduction.</strong> The reduced dimension has a large stride and the other one is contiguous: <code>sum(0)</code>. Here the kernel does not walk down one column at a time. It takes 32 columns at once, four vectors of 8 consecutive floats of the same row, and walks down the rows: each step reads 128 contiguous bytes of one row, and each lane of each vector accumulates one column (<code>vectorized_outer_sum</code>, the same <code>multi_row_sum</code> with the columns as its <code>nrows</code>). That turns the stride of 4000 bytes into reads of whole cache lines, and still gives every column its own cascade.</li>
+<li><strong>Neither is contiguous</strong>, for example a transposed view: the same two strategies with scalar accumulators.</li>
+</ul>
+<p>This is the time of each sum on one thread, for a 1000 x 1000 float32 matrix (4 MB, in the L3 after the first run) and a 4000 x 4000 one (64 MB):</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th><code>sum</code>, ms, one thread</th><th style="text-align:right">NumPy</th><th style="text-align:right">PyTorch</th><th style="text-align:right">Raxis</th></tr></thead><tbody><tr><td>1000 x 1000, <code>sum()</code></td><td style="text-align:right">0.151</td><td style="text-align:right">0.057</td><td style="text-align:right">0.026</td></tr><tr><td>1000 x 1000, <code>sum(0)</code></td><td style="text-align:right">0.039</td><td style="text-align:right">0.070</td><td style="text-align:right">0.035</td></tr><tr><td>1000 x 1000, <code>sum(1)</code></td><td style="text-align:right">0.159</td><td style="text-align:right">0.073</td><td style="text-align:right">0.034</td></tr><tr><td>4000 x 4000, <code>sum()</code></td><td style="text-align:right">7.60</td><td style="text-align:right">1.05</td><td style="text-align:right">0.78</td></tr><tr><td>4000 x 4000, <code>sum(0)</code></td><td style="text-align:right">0.92</td><td style="text-align:right">4.29</td><td style="text-align:right">1.63</td></tr><tr><td>4000 x 4000, <code>sum(1)</code></td><td style="text-align:right">9.82</td><td style="text-align:right">1.21</td><td style="text-align:right">0.89</td></tr></tbody></table>
+<p>Several things stand out, and each one has a reason:</p>
+<ul>
+<li><strong>NumPy’s <code>sum()</code> and <code>sum(1)</code> are 3 to 6 times slower</strong> than Raxis’s from the L3. Its pairwise sum adds blocks of 128 numbers with eight scalar accumulators, which is precise but runs at 0.1 to 0.15 ns per element on both systems, between the four-<code>float</code> and the one-vector loops of section 3. At 4000 x 4000 it takes 7.6 ms on Windows and 2.0 ms on Linux. On Windows its time per element jumps between sizes (0.14 ns at 10M elements, 0.32 ns at 16M), and I did not find why.</li>
+<li><strong>NumPy’s <code>sum(0)</code> is fast</strong>, because adding row after row into the output is an elementwise addition of contiguous rows: memory is read in order, and the output, one row of 16 KB at 4000 x 4000, stays in the L1. That is the same order that made its columns imprecise in the last section. It is a real trade-off, not a mistake: speed and precision ask for different orders.</li>
+<li><strong>PyTorch and Raxis lose at <code>sum(0)</code> of the 4000 x 4000 matrix</strong>, 1.63 ms against 0.92. Their strip of 32 columns reads 128 bytes of a row and then jumps 16,000 bytes to the next one. That is a stride like the ones in <a href="/posts/memory-and-the-cpu/#6-reading-with-a-stride">the interlude’s section 6</a>: the prefetcher follows it worse than reading in order, and with 64 MB almost every step lands on a different page. At 1000 x 1000, 4 MB, all three take the same time.</li>
+<li><strong>PyTorch on Windows is about twice as slow as Raxis</strong> whenever the data is in the caches, and 2.6 times at the 4000 x 4000 <code>sum(0)</code>. On Linux the two take the same time in every row (0.025 ms for the 1000 x 1000 <code>sum()</code>, 1.84 ms for the 4000 x 4000 <code>sum(0)</code>), and Raxis runs the same algorithm, also compiled with MSVC on Windows. So it seems to be something in PyTorch’s Windows build of this kernel, and I did not find what, at least not yet.</li>
+</ul>
+<h2 id="7-not-only-sums">7. Not only sums</h2>
+<p>A sum has an identity, 0, and one number of state. Other reductions need something else, and PyTorch has a path for each kind:</p>
+<ul>
+<li><strong>Integer sums, <code>max</code>, <code>min</code>, <code>amax</code>.</strong> Their result does not depend on the order (integer additions do not round, and a maximum is a maximum), so they need no cascade. They use a generic vectorized reduction with the same four vector accumulators (<code>cpu_reduce_kernel_vec</code>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/ops/cpu/reduce.h#L119-L160" title="raxis: libraxis/raxis/ops/cpu/reduce.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>reduce.h</code></a>), and the output is filled first with the identity: 0 for a sum, the lowest value of the type for a maximum.</li>
+<li><strong><code>mean</code></strong> is the sum divided by the number of elements.</li>
+<li><strong><code>argmax</code></strong> needs two numbers of state, the largest value so far and its position, and a rule for combining two of them. PyTorch writes such a reduction as a small struct of operations: <code>reduce(acc, value, index)</code> adds an element, <code>combine(acc, acc)</code> merges two partial results, and <code>project(acc)</code> gives the final value (<code>ArgMaxOps</code>, <a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/native/SharedReduceOps.h#L492-L495" title="pytorch: aten/src/ATen/native/SharedReduceOps.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>SharedReduceOps.h</code></a>). <code>binary_kernel_reduce</code> then runs it one output element at a time (<a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/native/cpu/Reduce.h" title="pytorch: aten/src/ATen/native/cpu/Reduce.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>Reduce.h</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/ops/cpu/reduce.h#L169-L210" title="raxis: libraxis/raxis/ops/cpu/reduce.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>reduce.h</code></a>).</li>
+<li><strong><code>var</code> and <code>std</code></strong> use the same structure with Welford’s algorithm, which keeps the running mean and the sum of squared differences in one pass (<code>WelfordOps</code>, <a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/native/SharedReduceOps.h#L85-L149" title="pytorch: aten/src/ATen/native/SharedReduceOps.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>SharedReduceOps.h</code></a>). The obvious formula, the mean of the squares minus the square of the mean, subtracts two large numbers that are almost equal, and in float32 that can leave nothing but rounding.</li>
+</ul>
+<p>The <code>combine</code> operation is what makes a reduction splittable: two threads can each reduce half of the elements, and one combination gives the result. That is where the threads come in.</p>
+<h2 id="8-parallel_for-splitting-a-range-between-threads">8. <code>parallel_for</code>: splitting a range between threads</h2>
+<p>Every parallel loop in PyTorch’s CPU code, elementwise or reduction, goes through one function, <code>parallel_for(begin, end, grain_size, f)</code>. It runs <code>f(chunk_begin, chunk_end)</code> on chunks of the range <code>[begin, end)</code>, on as many threads as it decides (<a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/Parallel-inl.h#L10-L43" title="pytorch: aten/src/ATen/Parallel-inl.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>Parallel-inl.h</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/util/parallel_impl.h#L11-L46" title="raxis: libraxis/raxis/util/parallel_impl.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>parallel_impl.h</code></a>):</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto" tabindex="0" data-language="cpp"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">lazy_init_num_threads</span><span style="color:#24292E;--shiki-dark:#E1E4E8">();</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">const</span><span style="color:#D73A49;--shiki-dark:#F97583"> int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> num_iters </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> end </span><span style="color:#D73A49;--shiki-dark:#F97583">-</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> begin;</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">const</span><span style="color:#D73A49;--shiki-dark:#F97583"> bool</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> use_parallel </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    num_iters </span><span style="color:#D73A49;--shiki-dark:#F97583">&gt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> grain_size </span><span style="color:#D73A49;--shiki-dark:#F97583">&amp;&amp;</span><span style="color:#6A737D;--shiki-dark:#6A737D">     // enough work</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    num_iters </span><span style="color:#D73A49;--shiki-dark:#F97583">&gt;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 1</span><span style="color:#D73A49;--shiki-dark:#F97583"> &amp;&amp;</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    !</span><span style="color:#6F42C1;--shiki-dark:#B392F0">in_parallel_region</span><span style="color:#24292E;--shiki-dark:#E1E4E8">() </span><span style="color:#D73A49;--shiki-dark:#F97583">&amp;&amp;</span><span style="color:#6A737D;--shiki-dark:#6A737D">      // not already inside a parallel loop</span></span>
+<span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">    get_num_threads</span><span style="color:#24292E;--shiki-dark:#E1E4E8">() </span><span style="color:#D73A49;--shiki-dark:#F97583">&gt;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 1</span><span style="color:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">if</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (</span><span style="color:#D73A49;--shiki-dark:#F97583">!</span><span style="color:#24292E;--shiki-dark:#E1E4E8">use_parallel) {</span></span>
+<span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">    f</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(begin, end);</span><span style="color:#6A737D;--shiki-dark:#6A737D">                // the calling thread does everything</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    return</span><span style="color:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span>
+<span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">invoke_parallel</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(begin, end, grain_size, f);</span></span></code></pre>
+<p>Three conditions keep the work on one thread:</p>
+<ul>
+<li><strong>The grain size.</strong> Below it, starting the other threads would cost more than the work. <a href="/posts/n-dimensional-loops/#9-threads-and-the-one-division-that-remains">The second article</a> met it: elementwise operations pass <code>GRAIN_SIZE</code>, 32,768 elements (<a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/TensorIterator.h#L76" title="pytorch: aten/src/ATen/TensorIterator.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>TensorIterator.h</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/tensor/tensor_iterator.h#L36" title="raxis: libraxis/raxis/tensor/tensor_iterator.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>tensor_iterator.h</code></a>).</li>
+<li><strong>No nested parallelism.</strong> If <code>f</code> itself calls <code>parallel_for</code>, for example in a kernel that runs an operation per row, the inner call runs serially. Otherwise every thread would start a team of its own, and 8 threads would become 64, competing for 8 cores.</li>
+<li><strong>The number of threads.</strong> By default PyTorch uses one thread per physical core, 8 on this CPU, not one per hardware thread (16), as <a href="/posts/memory-and-the-cpu/#11-cores-and-threads">the interlude</a> explains. <code>OMP_NUM_THREADS</code> or <code>torch.set_num_threads</code> change it. It is read the first time a thread calls <code>parallel_for</code>: that is the <code>lazy_init_num_threads</code>.</li>
+</ul>
+<p><code>invoke_parallel</code> is where the threads come from. With OpenMP, the default backend on Windows and Linux, it is a parallel region in which every thread computes its own chunk (<a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/ParallelOpenMP.h#L17-L52" title="pytorch: aten/src/ATen/ParallelOpenMP.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>ParallelOpenMP.h</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/util/parallel_openmp.h#L14-L48" title="raxis: libraxis/raxis/util/parallel_openmp.h" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>parallel_openmp.h</code></a>):</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto" tabindex="0" data-language="cpp"><code><span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">#pragma</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> omp</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> parallel</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> num_threads </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> omp_get_num_threads</span><span style="color:#24292E;--shiki-dark:#E1E4E8">();</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    if</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (grain_size </span><span style="color:#D73A49;--shiki-dark:#F97583">&gt;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">) {</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        num_threads </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> std</span><span style="color:#24292E;--shiki-dark:#E1E4E8">::</span><span style="color:#6F42C1;--shiki-dark:#B392F0">min</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(num_threads, </span><span style="color:#6F42C1;--shiki-dark:#B392F0">divup</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(end </span><span style="color:#D73A49;--shiki-dark:#F97583">-</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> begin, grain_size));</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    }</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> tid </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> omp_get_thread_num</span><span style="color:#24292E;--shiki-dark:#E1E4E8">();</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> chunk_size </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> divup</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(end </span><span style="color:#D73A49;--shiki-dark:#F97583">-</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> begin, num_threads);</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    int64_t</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> begin_tid </span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> begin </span><span style="color:#D73A49;--shiki-dark:#F97583">+</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> tid </span><span style="color:#D73A49;--shiki-dark:#F97583">*</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> chunk_size;</span></span>
+<span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">    if</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (begin_tid </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> end) {</span></span>
+<span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">        f</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(begin_tid, </span><span style="color:#6F42C1;--shiki-dark:#B392F0">std</span><span style="color:#24292E;--shiki-dark:#E1E4E8">::</span><span style="color:#6F42C1;--shiki-dark:#B392F0">min</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(end, begin_tid </span><span style="color:#D73A49;--shiki-dark:#F97583">+</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> chunk_size));</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p><code>divup(a, b)</code> is <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">⌈</mo><mi>a</mi><mi mathvariant="normal">/</mi><mi>b</mi><mo stretchy="false">⌉</mo></mrow><annotation encoding="application/x-tex">\lceil a / b \rceil</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em"></span><span class="mopen">⌈</span><span class="mord mathnormal">a</span><span class="mord">/</span><span class="mord mathnormal">b</span><span class="mclose">⌉</span></span></span></span>. There is one chunk per thread, but never so many chunks that one would be smaller than the grain size. All the threads of the team start even when some of them get no chunk: a comment in PyTorch’s code says that the <code>num_threads</code> clause of OpenMP, which would start fewer threads, is avoided because of a bug in GCC’s OpenMP runtime (<a href="https://github.com/pytorch/pytorch/issues/32008" target="_blank" rel="noopener">pytorch#32008</a>). With 8 threads:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th style="text-align:right">Elements</th><th style="text-align:right">Threads that get work</th><th style="text-align:right">Chunk</th><th>Ranges</th></tr></thead><tbody><tr><td style="text-align:right">32,768</td><td style="text-align:right">none, serial</td><td style="text-align:right"></td><td><code>[0, 32768)</code> on the calling thread</td></tr><tr><td style="text-align:right">32,769</td><td style="text-align:right">2</td><td style="text-align:right">16,385</td><td><code>[0, 16385)</code>, <code>[16385, 32769)</code></td></tr><tr><td style="text-align:right">100,000</td><td style="text-align:right">4</td><td style="text-align:right">25,000</td><td><code>[0, 25000)</code>, …, <code>[75000, 100000)</code></td></tr><tr><td style="text-align:right">1,048,576</td><td style="text-align:right">8</td><td style="text-align:right">131,072</td><td><code>[0, 131072)</code>, …, <code>[917504, 1048576)</code></td></tr></tbody></table>
+<p>What does starting the threads cost, and when does it pay? <code>a + b</code> into an existing output, float32, with 1 and 8 threads, in microseconds:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th style="text-align:right"><code>a + b</code> (<code>out=</code>), us</th><th style="text-align:right">PyTorch, 1 thread</th><th style="text-align:right">PyTorch, 8</th><th style="text-align:right">Raxis, 1 thread</th><th style="text-align:right">Raxis, 8</th></tr></thead><tbody><tr><td style="text-align:right">16,384</td><td style="text-align:right">1.9</td><td style="text-align:right">1.9</td><td style="text-align:right">2.2</td><td style="text-align:right">2.2</td></tr><tr><td style="text-align:right">32,768</td><td style="text-align:right">3.1</td><td style="text-align:right">3.1</td><td style="text-align:right">2.9</td><td style="text-align:right">2.9</td></tr><tr><td style="text-align:right">32,769</td><td style="text-align:right">2.7</td><td style="text-align:right">3.1</td><td style="text-align:right">2.9</td><td style="text-align:right">3.6</td></tr><tr><td style="text-align:right">65,536</td><td style="text-align:right">6.2</td><td style="text-align:right">4.0</td><td style="text-align:right">6.5</td><td style="text-align:right">4.6</td></tr><tr><td style="text-align:right">131,072</td><td style="text-align:right">12.9</td><td style="text-align:right">6.2</td><td style="text-align:right">13.7</td><td style="text-align:right">7.2</td></tr><tr><td style="text-align:right">1,048,576</td><td style="text-align:right">97.5</td><td style="text-align:right">25.7</td><td style="text-align:right">93.3</td><td style="text-align:right">28.0</td></tr></tbody></table>
+<p>At 32,769 elements two threads do half of the work each, and the time does not go down: the work saved, about 1.5 microseconds, is what it costs to hand the second half to another thread and wait for it. From 65,536 elements the threads start to pay, and at a million the eight of them are 3.8 times faster, not 8, because the three arrays, 12 MB, come from the L3, which the cores share. These numbers move by a microsecond or so from run to run, and Linux gives the same picture. The grain size is one number for every elementwise operation, although an <code>exp</code> does much more work per element than an addition; some kernels pass a smaller one of their own.</p>
+<p>One detail of the measurement: on Linux, PyTorch brings GCC’s OpenMP runtime and Raxis brings Intel’s, and in the same process the idle threads of one runtime keep spinning for a while, waiting for work, while the other one is timed. For this table the script measures each library in a process of its own. Raxis also has a backend without OpenMP, a thread pool of its own, which it uses on macOS (Apple’s compiler has no OpenMP); there <code>invoke_parallel</code> hands one task per chunk to the pool, and the calling thread runs the first one.</p>
+<h2 id="9-splitting-a-reduction">9. Splitting a reduction</h2>
+<p>A reduction cannot just cut its input into flat ranges, as <code>a + b</code> does: two threads that sum two halves of the same column would both add into the same output element at the same time, and one of the two additions could be lost. So <code>parallel_reduce</code>, the reduction’s version of <code>for_each</code>, picks one of three plans (<a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/native/TensorIteratorReduce.cpp#L24-L37" title="pytorch: aten/src/ATen/native/TensorIteratorReduce.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>TensorIteratorReduce.cpp</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/tensor/tensor_iterator_reduce.cpp#L31-L44" title="raxis: libraxis/raxis/tensor/tensor_iterator_reduce.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>tensor_iterator_reduce.cpp</code></a>):</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto" tabindex="0" data-language="cpp"><code><span class="line"><span style="color:#D73A49;--shiki-dark:#F97583">if</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (numel </span><span style="color:#D73A49;--shiki-dark:#F97583">&lt;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> GRAIN_SIZE </span><span style="color:#D73A49;--shiki-dark:#F97583">||</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> get_num_threads</span><span style="color:#24292E;--shiki-dark:#E1E4E8">() </span><span style="color:#D73A49;--shiki-dark:#F97583">==</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 1</span><span style="color:#D73A49;--shiki-dark:#F97583"> ||</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> in_parallel_region</span><span style="color:#24292E;--shiki-dark:#E1E4E8">()) {</span></span>
+<span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">    serial_for_each</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(loop, {</span><span style="color:#005CC5;--shiki-dark:#79B8FF">0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, numel});</span><span style="color:#6A737D;--shiki-dark:#6A737D">      // one thread</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">} </span><span style="color:#D73A49;--shiki-dark:#F97583">else</span><span style="color:#D73A49;--shiki-dark:#F97583"> if</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> (output.</span><span style="color:#6F42C1;--shiki-dark:#B392F0">numel</span><span style="color:#24292E;--shiki-dark:#E1E4E8">() </span><span style="color:#D73A49;--shiki-dark:#F97583">==</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> 1</span><span style="color:#24292E;--shiki-dark:#E1E4E8">) {</span></span>
+<span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">    two_pass_reduction</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(</span><span style="color:#D73A49;--shiki-dark:#F97583">*</span><span style="color:#005CC5;--shiki-dark:#79B8FF">this</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, loop);</span><span style="color:#6A737D;--shiki-dark:#6A737D">        // a single output element</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">} </span><span style="color:#D73A49;--shiki-dark:#F97583">else</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> {</span></span>
+<span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">    parallel_dim_reduction</span><span style="color:#24292E;--shiki-dark:#E1E4E8">(</span><span style="color:#D73A49;--shiki-dark:#F97583">*</span><span style="color:#005CC5;--shiki-dark:#79B8FF">this</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, loop);</span><span style="color:#6A737D;--shiki-dark:#6A737D">    // many output elements</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<figure class="reduction-split" data-astro-cid-m2lz3izq><svg viewBox="0 0 680 370" role="img" aria-labelledby="rs-title rs-desc" data-astro-cid-m2lz3izq><title id="rs-title">How a reduction is split between eight threads</title><desc id="rs-desc" data-astro-cid-m2lz3izq>On the left, sum(0) of a 1000 x 1000 matrix: the columns are split into eight bands, of 96, 128 (six times) and 136 columns, and each thread sums its columns whole, from the first row to the last, and writes its own part of the output row. On the right, sum() of 10 million elements: the input is cut into eight chunks of 1,250,000, each thread sums its chunk into its own slot of a buffer of eight, and a second pass adds the eight slots into the single output. The chunks depend on the number of threads, so the grouping of the additions does too.</desc><defs data-astro-cid-m2lz3izq><marker id="rs-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse" data-astro-cid-m2lz3izq><path d="M 0 0 L 10 5 L 0 10 z" class="head" data-astro-cid-m2lz3izq></path></marker></defs><text x="40" y="30" class="label" data-astro-cid-m2lz3izq>sum(0): split the outputs</text><text x="40" y="48" class="note" data-astro-cid-m2lz3izq>1000 x 1000, 8 threads, bands rounded to 32 columns</text><g data-astro-cid-m2lz3izq><rect x="40" y="78" width="25.92" height="150" class="band-a" data-astro-cid-m2lz3izq></rect><text x="52.96" y="157" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>0</text><rect x="40" y="254" width="25.92" height="18" class="band-a" data-astro-cid-m2lz3izq></rect><line x1="52.96" y1="230" x2="52.96" y2="252" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="65.92" y="78" width="34.56" height="150" class="band-b" data-astro-cid-m2lz3izq></rect><text x="83.2" y="157" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>1</text><rect x="65.92" y="254" width="34.56" height="18" class="band-b" data-astro-cid-m2lz3izq></rect><line x1="83.2" y1="230" x2="83.2" y2="252" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="100.48" y="78" width="34.56" height="150" class="band-a" data-astro-cid-m2lz3izq></rect><text x="117.76" y="157" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>2</text><rect x="100.48" y="254" width="34.56" height="18" class="band-a" data-astro-cid-m2lz3izq></rect><line x1="117.76" y1="230" x2="117.76" y2="252" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="135.04000000000002" y="78" width="34.56" height="150" class="band-b" data-astro-cid-m2lz3izq></rect><text x="152.32" y="157" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>3</text><rect x="135.04000000000002" y="254" width="34.56" height="18" class="band-b" data-astro-cid-m2lz3izq></rect><line x1="152.32" y1="230" x2="152.32" y2="252" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="169.60000000000002" y="78" width="34.56" height="150" class="band-a" data-astro-cid-m2lz3izq></rect><text x="186.88" y="157" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>4</text><rect x="169.60000000000002" y="254" width="34.56" height="18" class="band-a" data-astro-cid-m2lz3izq></rect><line x1="186.88" y1="230" x2="186.88" y2="252" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="204.16000000000003" y="78" width="34.56" height="150" class="band-b" data-astro-cid-m2lz3izq></rect><text x="221.44" y="157" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>5</text><rect x="204.16000000000003" y="254" width="34.56" height="18" class="band-b" data-astro-cid-m2lz3izq></rect><line x1="221.44" y1="230" x2="221.44" y2="252" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="238.72000000000003" y="78" width="34.56" height="150" class="band-a" data-astro-cid-m2lz3izq></rect><text x="256" y="157" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>6</text><rect x="238.72000000000003" y="254" width="34.56" height="18" class="band-a" data-astro-cid-m2lz3izq></rect><line x1="256" y1="230" x2="256" y2="252" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="273.28000000000003" y="78" width="36.72" height="150" class="band-b" data-astro-cid-m2lz3izq></rect><text x="291.64" y="157" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>7</text><rect x="273.28000000000003" y="254" width="36.72" height="18" class="band-b" data-astro-cid-m2lz3izq></rect><line x1="291.64" y1="230" x2="291.64" y2="252" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><text x="40" y="70" class="tiny" data-astro-cid-m2lz3izq>thread</text><text x="40" y="290" class="small" data-astro-cid-m2lz3izq>96, 128 (x6), 136 columns</text><text x="40" y="310" class="note" data-astro-cid-m2lz3izq>Each column is summed whole by one thread,</text><text x="40" y="328" class="note" data-astro-cid-m2lz3izq>in the same order with any number of threads.</text><text x="370" y="30" class="label" data-astro-cid-m2lz3izq>sum(): two passes</text><text x="370" y="48" class="note" data-astro-cid-m2lz3izq>10M elements, 8 chunks of 1,250,000</text><g data-astro-cid-m2lz3izq><rect x="370" y="78" width="27.5" height="36" class="band-a" data-astro-cid-m2lz3izq></rect><text x="383.75" y="100" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>0</text><line x1="383.75" y1="116" x2="403" y2="174" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line><rect x="392" y="176" width="20" height="24" class="band-a" data-astro-cid-m2lz3izq></rect><line x1="403" y1="202" x2="480" y2="260" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="397.5" y="78" width="27.5" height="36" class="band-b" data-astro-cid-m2lz3izq></rect><text x="411.25" y="100" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>1</text><line x1="411.25" y1="116" x2="425" y2="174" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line><rect x="414" y="176" width="20" height="24" class="band-b" data-astro-cid-m2lz3izq></rect><line x1="425" y1="202" x2="480" y2="260" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="425" y="78" width="27.5" height="36" class="band-a" data-astro-cid-m2lz3izq></rect><text x="438.75" y="100" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>2</text><line x1="438.75" y1="116" x2="447" y2="174" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line><rect x="436" y="176" width="20" height="24" class="band-a" data-astro-cid-m2lz3izq></rect><line x1="447" y1="202" x2="480" y2="260" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="452.5" y="78" width="27.5" height="36" class="band-b" data-astro-cid-m2lz3izq></rect><text x="466.25" y="100" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>3</text><line x1="466.25" y1="116" x2="469" y2="174" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line><rect x="458" y="176" width="20" height="24" class="band-b" data-astro-cid-m2lz3izq></rect><line x1="469" y1="202" x2="480" y2="260" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="480" y="78" width="27.5" height="36" class="band-a" data-astro-cid-m2lz3izq></rect><text x="493.75" y="100" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>4</text><line x1="493.75" y1="116" x2="491" y2="174" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line><rect x="480" y="176" width="20" height="24" class="band-a" data-astro-cid-m2lz3izq></rect><line x1="491" y1="202" x2="480" y2="260" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="507.5" y="78" width="27.5" height="36" class="band-b" data-astro-cid-m2lz3izq></rect><text x="521.25" y="100" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>5</text><line x1="521.25" y1="116" x2="513" y2="174" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line><rect x="502" y="176" width="20" height="24" class="band-b" data-astro-cid-m2lz3izq></rect><line x1="513" y1="202" x2="480" y2="260" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="535" y="78" width="27.5" height="36" class="band-a" data-astro-cid-m2lz3izq></rect><text x="548.75" y="100" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>6</text><line x1="548.75" y1="116" x2="535" y2="174" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line><rect x="524" y="176" width="20" height="24" class="band-a" data-astro-cid-m2lz3izq></rect><line x1="535" y1="202" x2="480" y2="260" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><g data-astro-cid-m2lz3izq><rect x="562.5" y="78" width="27.5" height="36" class="band-b" data-astro-cid-m2lz3izq></rect><text x="576.25" y="100" class="tiny-fg" text-anchor="middle" data-astro-cid-m2lz3izq>7</text><line x1="576.25" y1="116" x2="557" y2="174" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line><rect x="546" y="176" width="20" height="24" class="band-b" data-astro-cid-m2lz3izq></rect><line x1="557" y1="202" x2="480" y2="260" class="arrow" marker-end="url(#rs-arrow)" data-astro-cid-m2lz3izq></line></g><text x="600" y="100" class="tiny" data-astro-cid-m2lz3izq>input</text><text x="600" y="136" class="tiny" data-astro-cid-m2lz3izq>pass 1: each</text><text x="600" y="150" class="tiny" data-astro-cid-m2lz3izq>thread sums</text><text x="600" y="164" class="tiny" data-astro-cid-m2lz3izq>its chunk</text><text x="600" y="192" class="tiny" data-astro-cid-m2lz3izq>buffer</text><text x="600" y="224" class="tiny" data-astro-cid-m2lz3izq>pass 2: the</text><text x="600" y="238" class="tiny" data-astro-cid-m2lz3izq>8 slots</text><rect x="450" y="262" width="60" height="24" rx="3" class="out" data-astro-cid-m2lz3izq></rect><text x="480" y="278" class="small" text-anchor="middle" data-astro-cid-m2lz3izq>sum</text><text x="370" y="310" class="warm" data-astro-cid-m2lz3izq>The chunks are n / threads long, so the</text><text x="370" y="328" class="warm" data-astro-cid-m2lz3izq>grouping changes with the number of threads.</text></svg><figcaption data-astro-cid-m2lz3izq>With many output elements each thread owns some of them. With one, the threads share it through a buffer, and the result depends on where the chunks end (section 10).</figcaption></figure>
+<p><strong>Many output elements: split the outputs.</strong> <code>parallel_dim_reduction</code> picks a dimension that is not reduced, the outermost one with at least as many elements as there are threads (<code>find_split_dim</code>), and gives each thread a range of it with <code>parallel_for</code>. Each thread then runs the whole reduction for its own output elements, so no two threads ever write the same one (<a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/native/TensorIteratorReduce.cpp#L84-L138" title="pytorch: aten/src/ATen/native/TensorIteratorReduce.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>TensorIteratorReduce.cpp</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/tensor/tensor_iterator_reduce.cpp#L88-L182" title="raxis: libraxis/raxis/tensor/tensor_iterator_reduce.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>tensor_iterator_reduce.cpp</code></a>). For <code>x.sum(1)</code> of a 1000 x 1000 matrix it splits the rows: 125 rows per thread, each one summed whole by one thread.</p>
+<p>For <code>x.sum(0)</code> it splits the columns, with one more step: when the columns are contiguous, it rounds the boundaries of each range down to a multiple of 128 bytes, 32 floats, the width of the strip of section 6 (<code>round_columns</code>). Two threads then never share a strip, nor write to the same cache line of the output. With 8 threads, <code>parallel_for(0, 1000, 1, ...)</code> first gives each thread 125 columns, and the rounding moves the boundaries:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th style="text-align:right">Thread</th><th>Before rounding</th><th>After</th><th style="text-align:right">Columns</th></tr></thead><tbody><tr><td style="text-align:right">0</td><td><code>[0, 125)</code></td><td><code>[0, 96)</code></td><td style="text-align:right">96</td></tr><tr><td style="text-align:right">1</td><td><code>[125, 250)</code></td><td><code>[96, 224)</code></td><td style="text-align:right">128</td></tr><tr><td style="text-align:right">2 to 6</td><td><code>[250, 375)</code> … <code>[750, 875)</code></td><td><code>[224, 352)</code> … <code>[736, 864)</code></td><td style="text-align:right">128 each</td></tr><tr><td style="text-align:right">7</td><td><code>[875, 1000)</code></td><td><code>[864, 1000)</code></td><td style="text-align:right">136</td></tr></tbody></table>
+<p>The end of the last range is not rounded, so all 1000 columns are covered.</p>
+<p><strong>A single output element: two passes.</strong> <code>x.sum()</code> has one output, and there is nothing to split but the input. <code>two_pass_reduction</code> allocates a small buffer with one output element per thread, and runs <code>parallel_for</code> over the whole input with the grain size: each thread reduces its chunk into its own slot of the buffer, with the same kernel and the same cascade. Then a second, tiny reduction adds the slots of the buffer together (<a class="src" href="https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/native/TensorIteratorReduce.cpp#L43-L81" title="pytorch: aten/src/ATen/native/TensorIteratorReduce.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>pytorch</span><code data-astro-cid-3c55tpoi>TensorIteratorReduce.cpp</code></a>, <a class="src" href="https://github.com/pgmesa/raxis/blob/v0.5.0/libraxis/raxis/tensor/tensor_iterator_reduce.cpp#L51-L86" title="raxis: libraxis/raxis/tensor/tensor_iterator_reduce.cpp" target="_blank" rel="noopener" data-astro-cid-3c55tpoi><span class="src-repo" data-astro-cid-3c55tpoi>raxis</span><code data-astro-cid-3c55tpoi>tensor_iterator_reduce.cpp</code></a>). For 10 million elements and 8 threads, each thread sums 1,250,000 of them, and the second pass adds 8 numbers.</p>
+<p>What the threads buy here, on Windows, in milliseconds:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th><code>sum</code>, ms</th><th style="text-align:right">PyTorch, 1 thread</th><th style="text-align:right">PyTorch, 8</th><th style="text-align:right">Raxis, 1 thread</th><th style="text-align:right">Raxis, 8</th></tr></thead><tbody><tr><td>1000 x 1000, <code>sum()</code></td><td style="text-align:right">0.087</td><td style="text-align:right">0.018</td><td style="text-align:right">0.028</td><td style="text-align:right">0.011</td></tr><tr><td>1000 x 1000, <code>sum(0)</code></td><td style="text-align:right">0.114</td><td style="text-align:right">0.022</td><td style="text-align:right">0.044</td><td style="text-align:right">0.012</td></tr><tr><td>1000 x 1000, <code>sum(1)</code></td><td style="text-align:right">0.105</td><td style="text-align:right">0.018</td><td style="text-align:right">0.044</td><td style="text-align:right">0.010</td></tr><tr><td>4000 x 4000, <code>sum()</code></td><td style="text-align:right">1.45</td><td style="text-align:right">0.65</td><td style="text-align:right">0.79</td><td style="text-align:right">0.63</td></tr><tr><td>4000 x 4000, <code>sum(0)</code></td><td style="text-align:right">4.36</td><td style="text-align:right">1.58</td><td style="text-align:right">1.65</td><td style="text-align:right">0.76</td></tr><tr><td>4000 x 4000, <code>sum(1)</code></td><td style="text-align:right">1.48</td><td style="text-align:right">0.63</td><td style="text-align:right">1.12</td><td style="text-align:right">0.74</td></tr></tbody></table>
+<p>From the L3, eight threads are 2.5 to 5 times faster. From memory, with the 64 MB matrix, they add little to <code>sum()</code> and <code>sum(1)</code>, which one core already reads close to the limit of the memory. (64 MB in 0.79 ms is 81 GB/s, more than the 76.8 GB/s the RAM can deliver, so part of the matrix is still in the L3 from the run before.) <code>sum(0)</code>, whose strips read with a stride, gains twice as much: eight threads keep eight times as many reads on their way.</p>
+<h2 id="10-does-the-result-depend-on-the-number-of-threads">10. Does the result depend on the number of threads?</h2>
+<p>With many output elements, no: each output element is reduced by one thread, from its first element to its last, with the same cascade, whatever the number of threads. Only which thread does it changes.</p>
+<p>With one output element, yes. The chunks of <code>two_pass_reduction</code> are <code>divup(n, threads)</code> elements long, so the number of threads decides where the partial sums start and end, and the floats are added in a different grouping. I measured <code>sum()</code> of 10 million float32 from a normal distribution, whose exact sum is 1820.9482, and <code>sum(0)</code> and <code>sum(1)</code> of a 1000 x 1000 matrix, with 1 to 16 threads:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th style="text-align:right">Threads</th><th style="text-align:right">PyTorch <code>sum()</code></th><th style="text-align:right">Raxis <code>sum()</code></th><th><code>sum(0)</code> and <code>sum(1)</code> equal to 1 thread</th></tr></thead><tbody><tr><td style="text-align:right">1</td><td style="text-align:right">1820.9490</td><td style="text-align:right">1820.9490</td><td>yes</td></tr><tr><td style="text-align:right">2</td><td style="text-align:right">1820.9486</td><td style="text-align:right">1820.9486</td><td>yes</td></tr><tr><td style="text-align:right">3</td><td style="text-align:right">1820.9487</td><td style="text-align:right">1820.9487</td><td>yes</td></tr><tr><td style="text-align:right">4</td><td style="text-align:right">1820.9486</td><td style="text-align:right">1820.9486</td><td>yes</td></tr><tr><td style="text-align:right">6</td><td style="text-align:right">1820.9487</td><td style="text-align:right">1820.9487</td><td>yes</td></tr><tr><td style="text-align:right">8</td><td style="text-align:right">1820.9492</td><td style="text-align:right">1820.9492</td><td>yes</td></tr><tr><td style="text-align:right">16</td><td style="text-align:right">1820.9486</td><td style="text-align:right">1820.9486</td><td>yes</td></tr></tbody></table>
+<p>The results differ in the last digits. Around 1820, two neighbouring float32 numbers are 0.000122 apart, so these are differences of two to five steps. None of them is the exact value, and one thread is not more exact than eight: they are all different roundings of 1820.9482. PyTorch and Raxis give the same bits at every thread count, because they split the work at the same places and add in the same order, and every <code>sum(0)</code> and <code>sum(1)</code> is identical to the one-thread result. On Linux the table is the same except for the first row, where both give 1820.9487.</p>
+<p>This matters when you compare two runs. A training run on a machine with another number of cores, or with <code>OMP_NUM_THREADS</code> set differently, sums its losses and norms with other roundings, and its numbers drift apart in the last digits from the first step. For a model this is noise, but a test that compares two results bit for bit has to fix the number of threads. A fixed split, the same chunks whatever the number of threads, would make <code>sum()</code> independent of it too, at the cost of choosing that split; neither PyTorch nor Raxis does that today.</p>
+<h2 id="key-takeaways">Key takeaways</h2>
+<ul>
+<li><strong>A reduction is a TensorIterator whose output does not move</strong> (<a href="#2-a-tensoriterator-whose-output-does-not-move">section 2</a>): a stride of 0 along the reduced dimensions.</li>
+<li><strong>One accumulator is slow and imprecise</strong> (<a href="#3-the-obvious-loop-and-why-it-is-slow">sections 3</a> and <a href="#4-why-it-is-also-wrong">4</a>): 22 times slower than 32 accumulators, and <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>25</mn></msup></mrow><annotation encoding="application/x-tex">2^{25}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em"><span style="top:-3.063em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">25</span></span></span></span></span></span></span></span></span></span></span></span> ones add up to <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>24</mn></msup></mrow><annotation encoding="application/x-tex">2^{24}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em"><span style="top:-3.063em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">24</span></span></span></span></span></span></span></span></span></span></span></span>. The cascade sum fixes both (<a href="#5-the-cascade-sum">section 5</a>).</li>
+<li><strong>Threads have a cost</strong> (<a href="#8-parallel_for-splitting-a-range-between-threads">section 8</a>): PyTorch does not split an operation below 32,768 elements, and on the 9700X an addition starts to gain from threads only at about twice that.</li>
+<li><strong><code>sum(dim)</code> gives the same bits with any number of threads, and <code>sum()</code> does not</strong> (<a href="#10-does-the-result-depend-on-the-number-of-threads">section 10</a>), in PyTorch as in Raxis.</li>
+</ul>
+<h2 id="further-reading">Further reading</h2>
+<ul>
+<li>Nicholas J. Higham, “The Accuracy of Floating Point Summation”, SIAM Journal on Scientific Computing, 1993: the error bounds of the recursive, pairwise and compensated sums, and when each one wins.</li>
+<li>David Goldberg, “What Every Computer Scientist Should Know About Floating-Point Arithmetic”, ACM Computing Surveys, 1991: rounding, and why the order of the additions matters.</li>
+<li><a href="https://en.wikipedia.org/wiki/Kahan_summation_algorithm" target="_blank" rel="noopener">Kahan summation</a>, a compensated sum that carries the lost low bits along: more precise than pairwise, but four operations per element instead of one.</li>
+<li>The <a href="https://numpy.org/doc/stable/reference/generated/numpy.sum.html" target="_blank" rel="noopener">notes of NumPy’s <code>sum</code></a> on pairwise summation and the fast axis.</li>
+<li><a href="https://www.openmp.org/specifications/" target="_blank" rel="noopener">The OpenMP specification</a>, for <code>#pragma omp parallel</code> and the variables that set the number of threads.</li>
+</ul>
+<p>If something is not clear, or you think I got something wrong, leave a comment.</p><nav class="series-prev-next" data-astro-cid-x3pxgsip><a href="/posts/cpu-kernels/" data-astro-cid-x3pxgsip>&larr; How a PyTorch kernel uses the vector registers of every CPU</a><a href="/posts/autograd/" data-astro-cid-x3pxgsip>How PyTorch computes gradients &rarr;</a></nav></article><script type="module">var e=`M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5`,t=e=>`<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${e}" /></svg>`,n=null;function r(e,r){e.classList.add(`fig-zoomed`),document.documentElement.classList.add(`fig-zoom-open`);let i=0;for(let t of e.children)t.tagName.toLowerCase()!==`svg`&&t!==r&&t instanceof HTMLElement&&t.offsetParent!==null&&(i+=t.offsetHeight+8);let a=getComputedStyle(e);i+=parseFloat(a.paddingTop)+parseFloat(a.paddingBottom),e.style.setProperty(`--fig-chrome`,`${i}px`),r.innerHTML=t(`M6 6l12 12M18 6L6 18`),r.setAttribute(`aria-label`,`Close the enlarged figure`),r.setAttribute(`aria-expanded`,`true`),r.focus(),n={fig:e,button:r},history.pushState({figZoom:!0},``)}function i(){if(!n)return;let{fig:r,button:i}=n;n=null,r.classList.remove(`fig-zoomed`),document.documentElement.classList.remove(`fig-zoom-open`),i.innerHTML=t(e),i.setAttribute(`aria-label`,`Enlarge the figure`),i.setAttribute(`aria-expanded`,`false`),r.scrollIntoView({block:`nearest`}),i.focus()}function a(){history.state?.figZoom?history.back():i()}for(let i of document.querySelectorAll(`article figure`)){let o=i.querySelector(`svg`);if(!o)continue;let s=o.viewBox.baseVal;s&&s.height>0&&(i.style.setProperty(`--fig-ratio`,`${s.width/s.height}`),i.style.setProperty(`--fig-max`,`${1.5*s.width}px`));let c=document.createElement(`button`);c.type=`button`,c.className=`fig-zoom-button`,c.innerHTML=t(e),c.setAttribute(`aria-label`,`Enlarge the figure`),c.setAttribute(`aria-expanded`,`false`),c.addEventListener(`click`,()=>n?a():r(i,c)),i.classList.add(`fig-zoomable`),i.prepend(c)}addEventListener(`popstate`,i),addEventListener(`keydown`,e=>{e.key===`Escape`&&n&&a()});</script><section class="comments"><script src="https://giscus.app/client.js" data-repo="pgmesa/raxis" data-repo-id="R_kgDOQqvY9Q" data-category="Announcements" data-category-id="DIC_kwDOQqvY9c4DLXOo" data-mapping="pathname" data-strict="1" data-reactions-enabled="1" data-input-position="top" data-theme="preferred_color_scheme" data-lang="en" data-loading="lazy" crossorigin="anonymous" async></script></section></main></body></html>
